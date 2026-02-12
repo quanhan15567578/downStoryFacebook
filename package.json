@@ -1,3 +1,20 @@
-"scripts": {
-  "start": "node index.js"
+{
+  "name": "fb-story-bot",
+  "version": "1.0.0",
+  "description": "Facebook Story Downloader Bot",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "telegraf": "^4.16.3",
+    "axios": "^1.7.7",
+    "cheerio": "^1.0.0",
+    "@xmldom/xmldom": "^0.8.10",
+    "lowdb": "^7.0.1",
+    "archiver": "^7.0.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
 }
