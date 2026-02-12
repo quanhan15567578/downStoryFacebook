@@ -12,7 +12,8 @@
     "cheerio": "^1.0.0",
     "@xmldom/xmldom": "^0.8.10",
     "lowdb": "^7.0.1",
-    "archiver": "^7.0.1"
+    "archiver": "^7.0.1",
+     "express": "^4.19.2"
   },
   "engines": {
     "node": ">=18"
