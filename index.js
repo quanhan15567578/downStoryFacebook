@@ -7,9 +7,17 @@ const { exec } = require('child_process');
 const util = require('util');
 const archiver = require('archiver');
 const { DOMParser } = require('@xmldom/xmldom');
-const low = require('lowdb');
-const FileSync = require('lowdb/adapters/FileSync');
+import { LowSync } from 'lowdb';
+import { JSONFileSync } from 'lowdb/node';
 
+const adapter = new JSONFileSync('database.json');
+const db = new LowSync(adapter);
+
+// Đảm bảo default
+if (!db.data) {
+  db.data = { profiles: [], downloaded: {} };
+  db.write();
+}
 const TELEGRAM_TOKEN = '8578868890:AAFs1-9_CDQYF81GRVeAJcZI5p_lFuViInc';           // ← thay bằng token thật
 const ADMIN_CHAT_ID = 452130340;                
 
