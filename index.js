@@ -15,10 +15,8 @@ const adapter = new JSONFileSync('database.json');
 const defaultData = { profiles: [], downloaded: {} };
 const db = new LowSync(adapter, defaultData);
 
-// ✅ FIX 1: Đọc database từ file trước khi sử dụng
 db.read();
 
-// Đảm bảo default data nếu file trống/corrupt
 if (!db.data) {
   db.data = { profiles: [], downloaded: {} };
   db.write();
@@ -26,31 +24,138 @@ if (!db.data) {
 
 const execPromise = util.promisify(exec);
 
-// Token từ env (bắt buộc!)
 const TELEGRAM_TOKEN = '8578868890:AAFs1-9_CDQYF81GRVeAJcZI5p_lFuViInc';
-
-const ADMIN_CHAT_ID = 452130340;  // Nếu muốn, chuyển sang process.env.ADMIN_CHAT_ID
+const ADMIN_CHAT_ID = 452130340;
 
 const bot = new Telegraf(TELEGRAM_TOKEN);
 
 // ──────────────────────────────────────── Helper: Normalize URL ────────────────────────────────────────
-// ✅ FIX 2: Hàm chuẩn hóa URL để đảm bảo có https:// và www.
 function normalizeProfileUrl(url) {
   let normalized = url.trim();
   
-  // Thêm https:// nếu thiếu
   if (!normalized.startsWith('http://') && !normalized.startsWith('https://')) {
     normalized = 'https://' + normalized;
   }
   
-  // Thêm www. nếu thiếu (Facebook thường yêu cầu www)
   normalized = normalized.replace('https://facebook.com/', 'https://www.facebook.com/');
   normalized = normalized.replace('http://facebook.com/', 'https://www.facebook.com/');
   
   return normalized;
 }
 
-// ──────────────────────────────────────── Middleware: Chỉ admin dùng lệnh ────────────────────────────────────────
+// ✅ NEW: Nhiều User-Agent khác nhau để tránh bị block
+const USER_AGENTS = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+];
+
+let currentUAIndex = 0;
+
+function getNextUserAgent() {
+  const ua = USER_AGENTS[currentUAIndex];
+  currentUAIndex = (currentUAIndex + 1) % USER_AGENTS.length;
+  return ua;
+}
+
+// ✅ NEW: Fetch với nhiều strategies và retry
+async function fetchWithHeaders(url, retries = 3) {
+  const errors = [];
+  
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const userAgent = getNextUserAgent();
+      
+      console.log(`   🔄 Attempt ${attempt}/${retries} - UA: ${userAgent.slice(0, 50)}...`);
+      
+      const response = await axios.get(url, {
+        headers: {
+          'User-Agent': userAgent,
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9,vi;q=0.8',
+          'Accept-Encoding': 'gzip, deflate, br',
+          'DNT': '1',
+          'Connection': 'keep-alive',
+          'Upgrade-Insecure-Requests': '1',
+          'Sec-Fetch-Dest': 'document',
+          'Sec-Fetch-Mode': 'navigate',
+          'Sec-Fetch-Site': 'none',
+          'Sec-Fetch-User': '?1',
+          'Cache-Control': 'max-age=0',
+        },
+        maxRedirects: 10,
+        timeout: 30000,
+        validateStatus: function (status) {
+          return status >= 200 && status < 500; // Chấp nhận cả 4xx để debug
+        }
+      });
+      
+      if (response.status === 400) {
+        throw new Error(`HTTP 400: ${url}\nResponse: ${response.data?.toString().slice(0, 200)}`);
+      }
+      
+      if (response.status === 404) {
+        throw new Error(`HTTP 404: URL không tồn tại hoặc đã bị xóa`);
+      }
+      
+      if (response.status >= 400) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+      
+      console.log(`   ✅ Success with UA ${attempt}`);
+      return response;
+      
+    } catch (err) {
+      errors.push(`Attempt ${attempt}: ${err.message}`);
+      console.log(`   ❌ Attempt ${attempt} failed:`, err.message);
+      
+      if (attempt < retries) {
+        const delay = attempt * 2000; // 2s, 4s, 6s...
+        console.log(`   ⏳ Waiting ${delay/1000}s before retry...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+  }
+  
+  // Tất cả attempts đều fail
+  throw new Error(`All ${retries} attempts failed:\n${errors.join('\n')}`);
+}
+
+// ✅ NEW: Validate story URL trước khi fetch
+function validateStoryUrl(url) {
+  try {
+    const urlObj = new URL(url);
+    
+    // Phải là facebook.com
+    if (!urlObj.hostname.includes('facebook.com')) {
+      return { valid: false, reason: 'URL không phải của Facebook' };
+    }
+    
+    // Phải có /stories/ trong path
+    if (!urlObj.pathname.includes('/stories/')) {
+      return { valid: false, reason: 'URL không phải là story (thiếu /stories/)' };
+    }
+    
+    // Extract story ID
+    const storyIdMatch = urlObj.pathname.match(/stories\/(\d+)/);
+    if (!storyIdMatch) {
+      return { valid: false, reason: 'Không tìm thấy story ID trong URL' };
+    }
+    
+    return { 
+      valid: true, 
+      storyId: storyIdMatch[1],
+      normalized: normalizeProfileUrl(url)
+    };
+    
+  } catch (err) {
+    return { valid: false, reason: `URL không hợp lệ: ${err.message}` };
+  }
+}
+
+// ──────────────────────────────────────── Middleware ────────────────────────────────────────
 bot.use(async (ctx, next) => {
   if (ctx.from.id !== ADMIN_CHAT_ID) {
     if (['/start', '/help'].includes(ctx.message?.text)) {
@@ -61,7 +166,7 @@ bot.use(async (ctx, next) => {
   await next();
 });
 
-// ──────────────────────────────────────── Lệnh điều khiển ────────────────────────────────────────
+// ──────────────────────────────────────── Commands ────────────────────────────────────────
 bot.command('start', (ctx) => ctx.reply('Facebook Story Downloader Bot\n\nDùng các lệnh:\n/startdl → chạy tất cả\nDOWN <url story> → tải 1 story\nADD <profile url> → thêm profile\nREMOVE <url hoặc username> → xoá\n/list → xem danh sách'));
 
 bot.command('help', (ctx) => ctx.reply('Các lệnh:\n/startdl\nDOWN https://...\nADD https://www.facebook.com/...\nREMOVE https://... hoặc REMOVE username\n/list'));
@@ -74,9 +179,17 @@ bot.command('startdl', async (ctx) => {
 
 bot.hears(/^DOWN\s+(https?:\/\/.+)$/i, async (ctx) => {
   const url = ctx.match[1].trim();
-  ctx.reply(`Đang xử lý story: ${url}`);
+  
+  // ✅ Validate URL trước
+  const validation = validateStoryUrl(url);
+  if (!validation.valid) {
+    return ctx.reply(`❌ URL không hợp lệ:\n${validation.reason}\n\n💡 Ví dụ URL đúng:\nhttps://www.facebook.com/stories/123456789\nhttps://www.facebook.com/username/stories/123456789`);
+  }
+  
+  ctx.reply(`📖 Story ID: ${validation.storyId}\n🔍 Đang xử lý...`);
+  
   try {
-    await processSingleStory(url, ctx);
+    await processSingleStory(validation.normalized, ctx);
   } catch (err) {
     ctx.reply(`❌ LỖI: ${err.message}`);
   }
@@ -84,11 +197,8 @@ bot.hears(/^DOWN\s+(https?:\/\/.+)$/i, async (ctx) => {
 
 bot.hears(/^ADD\s+(.+)$/i, async (ctx) => {
   let url = ctx.match[1].trim();
-  
-  // Chuẩn hóa URL
   url = normalizeProfileUrl(url);
 
-  // Reload data để đảm bảo có data mới nhất
   db.read();
   const profiles = db.data.profiles || [];
   
@@ -131,7 +241,7 @@ bot.hears(/^REMOVE\s+(.+)$/i, async (ctx) => {
 });
 
 bot.command('list', (ctx) => {
-  db.read(); // Đảm bảo đọc data mới nhất
+  db.read();
   const profiles = db.data.profiles || [];
   if (!profiles.length) return ctx.reply('Danh sách trống.');
   ctx.reply(`📋 Danh sách profiles (${profiles.length}):\n${profiles.slice(0, 50).join('\n')}${profiles.length > 50 ? `\n\n... và ${profiles.length - 50} profile khác` : ''}`);
@@ -187,18 +297,6 @@ function getUsernameFromStoryData(storyData) {
   }
 }
 
-async function fetchWithHeaders(url) {
-  return axios.get(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.5',
-    },
-    maxRedirects: 5,
-    timeout: 30000,
-  });
-}
-
 // ──────────────────────────────────────── Fetch Story ────────────────────────────────────────
 async function fetchProfileHtml(profileUrl) {
   const res = await fetchWithHeaders(profileUrl);
@@ -212,7 +310,7 @@ async function extractStoryUrlFromProfile(html) {
     const href = $(el).attr('href');
     if (href && href.includes('/stories/') && !href.includes('/share/')) {
       storyHref = href.startsWith('http') ? href : `https://www.facebook.com${href}`;
-      return false; // dừng each
+      return false;
     }
   });
   return storyHref;
@@ -296,7 +394,6 @@ async function downloadFacebookStoryVideo(media, username, folderPath, id) {
       ? [{ progressive_url: media.playable_url_quality_hd || media.playable_url, metadata: { quality: 'HD' } }]
       : [];
 
-  // Ưu tiên DASH
   if (dash) {
     const parsed = parseDashManifest(dash);
     if (parsed.video) {
@@ -328,7 +425,6 @@ async function downloadFacebookStoryVideo(media, username, folderPath, id) {
     }
   }
 
-  // Fallback progressive
   const hdUrl = progressive.find(p => p.metadata?.quality === 'HD')?.progressive_url;
   const sdUrl = progressive.find(p => p.metadata?.quality === 'SD')?.progressive_url;
 
@@ -391,7 +487,6 @@ async function processProfile(profileUrl) {
   let username = 'Unknown';
 
   try {
-    // ✅ Chuẩn hóa URL trước khi fetch
     const normalizedUrl = normalizeProfileUrl(profileUrl);
     console.log(`📍 Đang xử lý: ${normalizedUrl}`);
     
@@ -469,12 +564,13 @@ async function processProfile(profileUrl) {
 
 async function processAllProfiles() {
   await cleanOldDownloaded();
-  db.read(); // Đảm bảo load data mới nhất
+  db.read();
   const profiles = db.data.profiles || [];
   console.log(`\n🚀 Bắt đầu xử lý ${profiles.length} profiles...`);
   
   for (const url of profiles) {
     await processProfile(url);
+    await new Promise(resolve => setTimeout(resolve, 1000)); // 1s delay giữa mỗi profile
   }
   
   console.log(`\n✅ Hoàn tất xử lý tất cả profiles\n`);
@@ -488,13 +584,13 @@ async function processSingleStory(storyUrl, ctx) {
     console.log(`📖 Đang xử lý story: ${storyUrl}`);
     
     const storyData = await fetchStoryJson(storyUrl);
-    if (!storyData) throw new Error('Không lấy được dữ liệu story');
+    if (!storyData) throw new Error('Không lấy được dữ liệu story - có thể story đã hết hạn hoặc bị ẩn');
 
     username = getUsernameFromStoryData(storyData);
     console.log(`   👤 Username: ${username}`);
 
     const bucketIdMatch = storyUrl.match(/stories\/(\d+)/);
-    if (!bucketIdMatch) throw new Error('Không tìm thấy bucket ID');
+    if (!bucketIdMatch) throw new Error('Không tìm thấy bucket ID trong URL');
 
     const bucketId = bucketIdMatch[1];
     console.log(`   🆔 Bucket ID: ${bucketId}`);
@@ -506,13 +602,13 @@ async function processSingleStory(storyUrl, ctx) {
       }
     });
 
-    if (!bucketData) throw new Error('Không tìm thấy bucket data');
+    if (!bucketData) throw new Error('Không tìm thấy bucket data - story có thể đã bị xóa');
 
     const nodes = bucketData.unified_stories_with_notes?.edges || [];
     console.log(`   📊 Tìm thấy ${nodes.length} story items`);
     
     if (!nodes.length) {
-      await bot.telegram.sendMessage(ADMIN_CHAT_ID, `ℹ️ Story ${storyUrl} không có media mới.`);
+      await bot.telegram.sendMessage(ADMIN_CHAT_ID, `ℹ️ Story không có media hoặc đã hết hạn`);
       return;
     }
 
@@ -554,30 +650,48 @@ async function processSingleStory(storyUrl, ctx) {
 
     if (downloadedFiles.length > 0) {
       await zipAndSend(folderPath, folderName);
-      await bot.telegram.sendMessage(ADMIN_CHAT_ID, `✅ Đã tải và gửi ${downloadedFiles.length} file từ story riêng lẻ của ${username}`);
+      await bot.telegram.sendMessage(ADMIN_CHAT_ID, `✅ Đã tải và gửi ${downloadedFiles.length} file từ story của ${username}`);
       console.log(`   📦 Đã gửi zip với ${downloadedFiles.length} files`);
     } else {
       await fs.rm(folderPath, { recursive: true, force: true }).catch(() => {});
-      await bot.telegram.sendMessage(ADMIN_CHAT_ID, `ℹ️ Không có media mới từ story: ${storyUrl}`);
+      await bot.telegram.sendMessage(ADMIN_CHAT_ID, `ℹ️ Không có media mới từ story này`);
       console.log(`   ℹ️  Không có file mới để download`);
     }
   } catch (err) {
     console.error(`❌ Lỗi xử lý story:`, err);
-    await bot.telegram.sendMessage(ADMIN_CHAT_ID, `❌ Lỗi khi xử lý story:\n${err.message}\n\nStack: ${err.stack?.slice(0, 500)}`);
+    
+    // Gửi message với hướng dẫn chi tiết hơn
+    let helpMessage = `❌ Lỗi: ${err.message}\n\n`;
+    
+    if (err.message.includes('400')) {
+      helpMessage += `💡 Lỗi 400 có thể do:\n`;
+      helpMessage += `• Story đã hết hạn (>24h)\n`;
+      helpMessage += `• Story bị ẩn với người lạ\n`;
+      helpMessage += `• Facebook đang block bot\n`;
+      helpMessage += `• URL không đúng format\n\n`;
+      helpMessage += `🔧 Thử:\n`;
+      helpMessage += `• Kiểm tra story vẫn còn trong trình duyệt\n`;
+      helpMessage += `• Copy lại URL từ trình duyệt\n`;
+      helpMessage += `• Đợi vài phút rồi thử lại`;
+    } else if (err.message.includes('404')) {
+      helpMessage += `💡 Story không tồn tại hoặc đã bị xóa`;
+    } else if (err.message.includes('timeout')) {
+      helpMessage += `💡 Kết nối timeout, thử lại sau`;
+    }
+    
+    await bot.telegram.sendMessage(ADMIN_CHAT_ID, helpMessage);
     throw err;
   }
 }
 
-// ──────────────────────────────────────── Khởi động Bot với Webhook ────────────────────────────────────────
+// ──────────────────────────────────────── Server ────────────────────────────────────────
 const app = express();
 
-// Để Render check healthy
 app.get('/', (req, res) => {
   res.send('Facebook Story Downloader Bot is running!');
 });
 
-// Webhook path (nên secret để tránh abuse)
-const SECRET_PATH = '/telegraf/' + TELEGRAM_TOKEN.replace(/:/g, '');  // Làm secret dựa trên token
+const SECRET_PATH = '/telegraf/' + TELEGRAM_TOKEN.replace(/:/g, '');
 
 app.use(bot.webhookCallback(SECRET_PATH));
 
@@ -585,7 +699,6 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`Server chạy trên port ${PORT}`);
 
-  // Set webhook
   const webhookUrl = `https://${process.env.RENDER_EXTERNAL_HOSTNAME || 'your-render-app-name.onrender.com'}${SECRET_PATH}`;
   try {
     await bot.telegram.setWebhook(webhookUrl);
@@ -595,6 +708,5 @@ app.listen(PORT, async () => {
   }
 });
 
-// Graceful shutdown
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
