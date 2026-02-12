@@ -24,9 +24,7 @@ if (!db.data) {
 
 const execPromise = util.promisify(exec);
 
-// Token từ env (bắt buộc!)
 const TELEGRAM_TOKEN = '8578868890:AAFs1-9_CDQYF81GRVeAJcZI5p_lFuViInc';
-
 const ADMIN_CHAT_ID = 452130340;
 
 const bot = new Telegraf(TELEGRAM_TOKEN);
@@ -58,7 +56,7 @@ function normalizeProfileUrl(url) {
   return normalized;
 }
 
-// ──────────────────────────────────────── Middleware: Chỉ admin dùng lệnh ────────────────────────────────────────
+// ──────────────────────────────────────── Middleware ────────────────────────────────────────
 bot.use(async (ctx, next) => {
   if (ctx.from.id !== ADMIN_CHAT_ID) {
     if (['/start', '/help'].includes(ctx.message?.text)) {
@@ -69,21 +67,23 @@ bot.use(async (ctx, next) => {
   await next();
 });
 
-// ──────────────────────────────────────── Lệnh điều khiển ────────────────────────────────────────
-bot.command('start', (ctx) => ctx.reply(`Facebook Story Downloader Bot
+// ──────────────────────────────────────── Commands ────────────────────────────────────────
+bot.command('start', (ctx) => ctx.reply(`🤖 Facebook Story Downloader Bot
 
-Các lệnh:
+📋 LỆNH CƠ BẢN:
 /startdl → chạy tất cả profiles
 /list → xem danh sách profiles
-/cookie → xem cookie hiện tại
-/showcookie → hiển thị cookie đang dùng
+/cookie → hướng dẫn lấy cookie
+/showcookie → xem cookie hiện tại
+/debug <url> → debug story URL
 
+✍️ LỆNH NHANH:
 DOWN <url> → tải 1 story
 ADD <url> → thêm profile
 REMOVE <url> → xóa profile
 SETCOOKIE <cookie> → set cookie mới
 
-Ví dụ:
+📝 VÍ DỤ:
 DOWN https://facebook.com/stories/123
 ADD facebook.com/username
 SETCOOKIE c_user=123;xs=abc...`));
@@ -96,48 +96,41 @@ bot.command('showcookie', (ctx) => {
     return ctx.reply('⚠️ Chưa có cookie nào được set.\n\nDùng lệnh:\nSETCOOKIE <cookie_string>');
   }
   
-  // Hiển thị một phần cookie để bảo mật
   const preview = cookie.length > 100 ? cookie.substring(0, 100) + '...' : cookie;
   ctx.reply(`🍪 Cookie hiện tại:\n${preview}\n\n📊 Độ dài: ${cookie.length} ký tự`);
 });
 
 bot.command('cookie', (ctx) => {
-  ctx.reply(`📖 HƯỚNG DẪN LẤY COOKIE FACEBOOK:
+  ctx.reply(`📖 HƯỚNG DẪN LẤY COOKIE:
 
-1. Mở Facebook trong Chrome/Firefox
-2. Nhấn F12 để mở DevTools
-3. Vào tab "Application" (Chrome) hoặc "Storage" (Firefox)
-4. Chọn "Cookies" → "https://www.facebook.com"
-5. Copy các giá trị quan trọng:
-   • c_user
-   • xs
-   • datr (optional)
-   • sb (optional)
+1️⃣ Mở Facebook trong Chrome
+2️⃣ Nhấn F12 → tab "Application"
+3️⃣ Chọn Cookies → facebook.com
+4️⃣ Copy các giá trị:
+   • c_user (BẮT BUỘC)
+   • xs (BẮT BUỘC)
+   • datr (nên có)
+   • sb (nên có)
 
-6. Ghép thành string:
-c_user=VALUE1;xs=VALUE2;datr=VALUE3;sb=VALUE4
+5️⃣ Ghép thành:
+c_user=VALUE;xs=VALUE;datr=VALUE;sb=VALUE
 
-7. Gửi cho bot:
-SETCOOKIE c_user=123456;xs=abc...def
+6️⃣ Gửi:
+SETCOOKIE c_user=123;xs=abc...
 
-⚠️ LƯU Ý:
-• Cookie có thể hết hạn sau vài tuần
-• KHÔNG chia sẻ cookie với người khác
-• Bot sẽ lưu cookie trong database.json`);
+⚠️ Cookie hết hạn sau 2-4 tuần`);
 });
 
 bot.hears(/^SETCOOKIE\s+(.+)$/is, async (ctx) => {
   const cookieString = ctx.match[1].trim();
   
-  // Validate cookie có chứa c_user và xs
   if (!cookieString.includes('c_user') || !cookieString.includes('xs')) {
-    return ctx.reply('❌ Cookie không hợp lệ!\n\nCần ít nhất:\nc_user=... và xs=...\n\nVí dụ:\nSETCOOKIE c_user=123456;xs=abc...def');
+    return ctx.reply('❌ Cookie không hợp lệ!\n\nCần ít nhất: c_user và xs\n\nVí dụ:\nSETCOOKIE c_user=123;xs=abc...');
   }
   
   saveCookies(cookieString);
-  ctx.reply('✅ Đã lưu cookie thành công!\n\nThử download 1 story để test:\nDOWN <story_url>');
+  ctx.reply('✅ Đã lưu cookie!\n\nTest bằng:\n/debug <story_url>');
   
-  // Xóa message chứa cookie để bảo mật
   try {
     await ctx.deleteMessage();
   } catch (err) {
@@ -145,10 +138,28 @@ bot.hears(/^SETCOOKIE\s+(.+)$/is, async (ctx) => {
   }
 });
 
+// ✅ LỆNH DEBUG MỚI
+bot.command('debug', async (ctx) => {
+  const args = ctx.message.text.split(' ');
+  if (args.length < 2) {
+    return ctx.reply('Dùng: /debug <story_url>\n\nVí dụ:\n/debug https://facebook.com/stories/123');
+  }
+  
+  const url = args[1];
+  const cookie = getCookieString();
+  
+  if (!cookie) {
+    return ctx.reply('⚠️ Chưa có cookie! Dùng /cookie để xem hướng dẫn.');
+  }
+  
+  ctx.reply('🔍 Đang debug...');
+  await debugStoryUrl(url, ctx);
+});
+
 bot.command('startdl', async (ctx) => {
   const cookie = getCookieString();
   if (!cookie) {
-    return ctx.reply('⚠️ Chưa có cookie! Dùng lệnh /cookie để xem hướng dẫn.');
+    return ctx.reply('⚠️ Chưa có cookie! Dùng /cookie để xem hướng dẫn.');
   }
   
   ctx.reply('🚀 Bắt đầu kiểm tra và download stories...');
@@ -161,7 +172,7 @@ bot.hears(/^DOWN\s+(https?:\/\/.+)$/i, async (ctx) => {
   const cookie = getCookieString();
   
   if (!cookie) {
-    return ctx.reply('⚠️ Chưa có cookie! Dùng lệnh /cookie để xem hướng dẫn.');
+    return ctx.reply('⚠️ Chưa có cookie! Dùng /cookie để xem hướng dẫn.');
   }
   
   ctx.reply(`📥 Đang xử lý story: ${url}`);
@@ -185,7 +196,7 @@ bot.hears(/^ADD\s+(.+)$/i, async (ctx) => {
 
   db.data.profiles.push(url);
   db.write();
-  ctx.reply(`✅ Đã thêm profile: ${url}`);
+  ctx.reply(`✅ Đã thêm: ${url}`);
 });
 
 bot.hears(/^REMOVE\s+(.+)$/i, async (ctx) => {
@@ -281,7 +292,7 @@ async function fetchWithHeaders(url) {
   const cookie = getCookieString();
   
   const headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.9,vi;q=0.8',
     'Accept-Encoding': 'gzip, deflate, br',
@@ -324,23 +335,120 @@ async function extractStoryUrlFromProfile(html) {
   return storyHref;
 }
 
-async function fetchStoryJson(storyUrl) {
+// ✅ CẢI THIỆN HÀM PARSE JSON
+async function fetchStoryJson(storyUrl, debug = false) {
   const res = await fetchWithHeaders(storyUrl);
   const html = res.data;
+  
+  if (debug) {
+    // Lưu HTML để debug
+    const debugPath = path.join(__dirname, 'temp', 'debug-story.html');
+    await fs.mkdir(path.join(__dirname, 'temp'), { recursive: true });
+    await fs.writeFile(debugPath, html, 'utf8');
+    console.log(`💾 Đã lưu HTML vào: ${debugPath}`);
+  }
+  
   const $ = cheerio.load(html);
+  let foundScripts = 0;
   let target = null;
 
-  $('script[type="application/json"][data-sjs]').each((_, el) => {
+  // Thử nhiều cách parse
+  $('script[type="application/json"]').each((_, el) => {
+    foundScripts++;
     try {
-      const data = JSON.parse($(el).html());
-      if (data?.require?.some(r => r?.[3]?.[0]?.__bbox?.result?.data?.bucket?.id)) {
-        target = data;
-        return false;
+      const rawText = $(el).html();
+      if (!rawText) return;
+      
+      const data = JSON.parse(rawText);
+      
+      if (debug) {
+        console.log(`📜 Script #${foundScripts}:`, {
+          hasRequire: !!data?.require,
+          requireLength: data?.require?.length || 0,
+          keys: Object.keys(data).slice(0, 5)
+        });
       }
-    } catch {}
+      
+      // Tìm bucket data
+      if (data?.require) {
+        for (const req of data.require) {
+          if (req?.[3]?.[0]?.__bbox?.result?.data?.bucket?.id) {
+            target = data;
+            if (debug) {
+              console.log(`✅ Tìm thấy bucket trong script #${foundScripts}`);
+            }
+            return false; // break
+          }
+        }
+      }
+    } catch (err) {
+      if (debug) {
+        console.log(`❌ Script #${foundScripts} parse error:`, err.message);
+      }
+    }
   });
 
+  if (debug) {
+    console.log(`📊 Tổng số scripts tìm thấy: ${foundScripts}`);
+    console.log(`🎯 Tìm thấy story data: ${!!target}`);
+  }
+
   return target;
+}
+
+// ✅ HÀM DEBUG MỚI
+async function debugStoryUrl(storyUrl, ctx) {
+  try {
+    await ctx.reply('🔍 Bước 1: Fetch HTML...');
+    const storyData = await fetchStoryJson(storyUrl, true);
+    
+    if (!storyData) {
+      await ctx.reply('❌ Không tìm thấy story data trong HTML\n\nCó thể:\n1. URL không phải story\n2. Story đã bị xóa\n3. Cookie hết hạn\n4. Bạn không có quyền xem story này');
+      return;
+    }
+    
+    await ctx.reply('✅ Bước 2: Parse JSON thành công!');
+    
+    const username = getUsernameFromStoryData(storyData);
+    await ctx.reply(`👤 Username: ${username}`);
+    
+    const bucketIdMatch = storyUrl.match(/stories\/(\d+)/);
+    if (!bucketIdMatch) {
+      await ctx.reply('❌ Không tìm thấy bucket ID trong URL');
+      return;
+    }
+    
+    const bucketId = bucketIdMatch[1];
+    await ctx.reply(`🆔 Bucket ID: ${bucketId}`);
+    
+    let bucketData = null;
+    storyData.require?.forEach(req => {
+      if (req?.[3]?.[0]?.__bbox?.result?.data?.bucket?.id === bucketId) {
+        bucketData = req[3][0].__bbox.result.data.bucket;
+      }
+    });
+    
+    if (!bucketData) {
+      await ctx.reply('❌ Không tìm thấy bucket data');
+      return;
+    }
+    
+    await ctx.reply('✅ Bước 3: Tìm thấy bucket data!');
+    
+    const nodes = bucketData.unified_stories_with_notes?.edges || [];
+    await ctx.reply(`📊 Số story items: ${nodes.length}`);
+    
+    if (nodes.length > 0) {
+      const node = nodes[0].node;
+      const media = node?.attachments?.[0]?.media;
+      await ctx.reply(`📷 Media type: ${media?.__typename || 'Unknown'}\n🆔 Media ID: ${media?.id || 'N/A'}`);
+    }
+    
+    await ctx.reply('✅ DEBUG HOÀN TẤT!\n\nStory này có thể download được. Dùng:\nDOWN ' + storyUrl);
+    
+  } catch (err) {
+    await ctx.reply(`❌ Lỗi debug:\n${err.message}\n\nStack:\n${err.stack?.slice(0, 500)}`);
+  }
 }
 
 // ──────────────────────────────────────── DASH Parser ────────────────────────────────────────
@@ -591,7 +699,7 @@ async function processSingleStory(storyUrl, ctx) {
     console.log(`📖 Đang xử lý story: ${storyUrl}`);
     
     const storyData = await fetchStoryJson(storyUrl);
-    if (!storyData) throw new Error('Không lấy được dữ liệu story');
+    if (!storyData) throw new Error('Không lấy được dữ liệu story - thử dùng /debug để kiểm tra');
 
     username = getUsernameFromStoryData(storyData);
     console.log(`   👤 Username: ${username}`);
@@ -666,12 +774,12 @@ async function processSingleStory(storyUrl, ctx) {
     }
   } catch (err) {
     console.error(`❌ Lỗi xử lý story:`, err);
-    await bot.telegram.sendMessage(ADMIN_CHAT_ID, `❌ Lỗi khi xử lý story:\n${err.message}\n\nStack: ${err.stack?.slice(0, 500)}`);
+    await bot.telegram.sendMessage(ADMIN_CHAT_ID, `❌ Lỗi khi xử lý story:\n${err.message}\n\n💡 Thử dùng /debug ${storyUrl}`);
     throw err;
   }
 }
 
-// ──────────────────────────────────────── Khởi động Bot với Webhook ────────────────────────────────────────
+// ──────────────────────────────────────── Khởi động Bot ────────────────────────────────────────
 const app = express();
 
 app.get('/', (req, res) => {
