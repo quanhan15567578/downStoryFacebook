@@ -15,7 +15,10 @@ const adapter = new JSONFileSync('database.json');
 const defaultData = { profiles: [], downloaded: {} };
 const db = new LowSync(adapter, defaultData);
 
-// Đảm bảo default
+// ✅ FIX 1: Đọc database từ file trước khi sử dụng
+db.read();
+
+// Đảm bảo default data nếu file trống/corrupt
 if (!db.data) {
   db.data = { profiles: [], downloaded: {} };
   db.write();
@@ -30,6 +33,23 @@ const ADMIN_CHAT_ID = 452130340;  // Nếu muốn, chuyển sang process.env.ADM
 
 const bot = new Telegraf(TELEGRAM_TOKEN);
 
+// ──────────────────────────────────────── Helper: Normalize URL ────────────────────────────────────────
+// ✅ FIX 2: Hàm chuẩn hóa URL để đảm bảo có https:// và www.
+function normalizeProfileUrl(url) {
+  let normalized = url.trim();
+  
+  // Thêm https:// nếu thiếu
+  if (!normalized.startsWith('http://') && !normalized.startsWith('https://')) {
+    normalized = 'https://' + normalized;
+  }
+  
+  // Thêm www. nếu thiếu (Facebook thường yêu cầu www)
+  normalized = normalized.replace('https://facebook.com/', 'https://www.facebook.com/');
+  normalized = normalized.replace('http://facebook.com/', 'https://www.facebook.com/');
+  
+  return normalized;
+}
+
 // ──────────────────────────────────────── Middleware: Chỉ admin dùng lệnh ────────────────────────────────────────
 bot.use(async (ctx, next) => {
   if (ctx.from.id !== ADMIN_CHAT_ID) {
@@ -42,9 +62,9 @@ bot.use(async (ctx, next) => {
 });
 
 // ──────────────────────────────────────── Lệnh điều khiển ────────────────────────────────────────
-bot.command('start', (ctx) => ctx.reply('Facebook Story Downloader Bot\n\nDùng các lệnh:\n/startdl → chạy tất cả\nX <url story> → tải 1 story\nY <profile url> → thêm profile\nDEL <url hoặc username> → xoá\n/list → xem danh sách'));
+bot.command('start', (ctx) => ctx.reply('Facebook Story Downloader Bot\n\nDùng các lệnh:\n/startdl → chạy tất cả\nDOWN <url story> → tải 1 story\nADD <profile url> → thêm profile\nREMOVE <url hoặc username> → xoá\n/list → xem danh sách'));
 
-bot.command('help', (ctx) => ctx.reply('Các lệnh:\n/startdl\nX https://...\nY https://www.facebook.com/...\nDEL https://... hoặc DEL username\n/list'));
+bot.command('help', (ctx) => ctx.reply('Các lệnh:\n/startdl\nDOWN https://...\nADD https://www.facebook.com/...\nREMOVE https://... hoặc REMOVE username\n/list'));
 
 bot.command('startdl', async (ctx) => {
   ctx.reply('Bắt đầu kiểm tra và download stories...');
@@ -52,39 +72,52 @@ bot.command('startdl', async (ctx) => {
   ctx.reply('Hoàn tất kiểm tra hôm nay.');
 });
 
-bot.hears(/^X\s+(https?:\/\/.+)$/i, async (ctx) => {
+bot.hears(/^DOWN\s+(https?:\/\/.+)$/i, async (ctx) => {
   const url = ctx.match[1].trim();
   ctx.reply(`Đang xử lý story: ${url}`);
-  await processSingleStory(url);
-  ctx.reply('Xong lệnh X.');
+  try {
+    await processSingleStory(url, ctx);
+  } catch (err) {
+    ctx.reply(`❌ LỖI: ${err.message}`);
+  }
 });
 
-bot.hears(/^Y\s+(https?:\/\/facebook\.com\/[^\/\s]+)$/i, async (ctx) => {
+bot.hears(/^ADD\s+(.+)$/i, async (ctx) => {
   let url = ctx.match[1].trim();
-  if (!url.startsWith('https://')) url = 'https://' + url;
+  
+  // Chuẩn hóa URL
+  url = normalizeProfileUrl(url);
 
+  // Reload data để đảm bảo có data mới nhất
+  db.read();
   const profiles = db.data.profiles || [];
-  if (profiles.includes(url) || profiles.includes(url.replace('www.', ''))) {
+  
+  if (profiles.includes(url)) {
     return ctx.reply('Profile này đã có trong danh sách.');
   }
 
   db.data.profiles.push(url);
   db.write();
-  ctx.reply(`Đã thêm profile: ${url}`);
+  ctx.reply(`✅ Đã thêm profile: ${url}`);
 });
 
-bot.hears(/^DEL\s+(.+)$/i, async (ctx) => {
+bot.hears(/^REMOVE\s+(.+)$/i, async (ctx) => {
   let input = ctx.match[1].trim();
   let url;
 
   if (input.startsWith('http')) {
-    url = input.trim();
+    url = normalizeProfileUrl(input);
   } else {
     url = `https://www.facebook.com/${input.trim()}`;
   }
 
+  db.read();
   const profiles = db.data.profiles || [];
-  const normalized = [url, url.replace('www.', ''), url.replace('https://facebook.com/', 'https://www.facebook.com/')];
+  const normalized = [
+    url, 
+    url.replace('www.', ''), 
+    url.replace('https://www.facebook.com/', 'https://facebook.com/')
+  ];
 
   const newProfiles = profiles.filter(p => !normalized.includes(p));
 
@@ -94,13 +127,14 @@ bot.hears(/^DEL\s+(.+)$/i, async (ctx) => {
 
   db.data.profiles = newProfiles;
   db.write();
-  ctx.reply(`Đã xoá: ${url}`);
+  ctx.reply(`✅ Đã xoá: ${url}`);
 });
 
 bot.command('list', (ctx) => {
+  db.read(); // Đảm bảo đọc data mới nhất
   const profiles = db.data.profiles || [];
   if (!profiles.length) return ctx.reply('Danh sách trống.');
-  ctx.reply(`Danh sách profiles (${profiles.length}):\n${profiles.join('\n')}`);
+  ctx.reply(`📋 Danh sách profiles (${profiles.length}):\n${profiles.slice(0, 50).join('\n')}${profiles.length > 50 ? `\n\n... và ${profiles.length - 50} profile khác` : ''}`);
 });
 
 // ──────────────────────────────────────── Utils ────────────────────────────────────────
@@ -111,6 +145,7 @@ async function getTodayKey() {
 async function cleanOldDownloaded() {
   const today = await getTodayKey();
   const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+  db.read();
   const state = db.data.downloaded || {};
   Object.keys(state).forEach(key => {
     if (key !== today && key !== yesterday) {
@@ -121,10 +156,12 @@ async function cleanOldDownloaded() {
 }
 
 async function isDownloaded(id, dateKey) {
+  db.read();
   return (db.data.downloaded?.[dateKey] || []).includes(id);
 }
 
 async function markDownloaded(id, dateKey) {
+  db.read();
   if (!db.data.downloaded) db.data.downloaded = {};
   if (!db.data.downloaded[dateKey]) db.data.downloaded[dateKey] = [];
   if (!db.data.downloaded[dateKey].includes(id)) {
@@ -247,57 +284,48 @@ async function downloadFile(url, outputPath) {
 
 // ──────────────────────────────────────── Download Logic ────────────────────────────────────────
 async function downloadFacebookStoryVideo(media, username, folderPath, id) {
-  const progressive = media?.videoDeliveryResponseFragment?.videoDeliveryResponseResult?.progressive_urls || [];
-  const dashManifests = media?.videoDeliveryResponseFragment?.videoDeliveryResponseResult?.dash_manifests || [];
-
-  let hasHighDash = false;
-  let dashVideoUrl, dashAudioUrl, dashQualityLabel;
-
-  if (dashManifests.length > 0 && dashManifests[0]?.manifest_xml) {
-    try {
-      const parsed = parseDashManifest(dashManifests[0].manifest_xml);
-      if (parsed.video && parsed.video.quality > 720) {
-        hasHighDash = true;
-        dashVideoUrl = parsed.video.uri;
-        dashAudioUrl = parsed.audio?.uri;
-        dashQualityLabel = parsed.video.label || `${parsed.video.quality}p`;
-      }
-    } catch (e) {
-      console.warn(`DASH parse error for ${id}: ${e.message}`);
-    }
-  }
-
   const baseName = `${id} - ${username.replace(/[^a-zA-Z0-9]/g, '_')}`;
-  const finalPath = path.join(folderPath, `${baseName}.${hasHighDash ? dashQualityLabel : 'HD/SD'}.mp4`);
+  
+  const dash = media?.video_dash_manifest;
+  const progressive = media?.browser_native_hd_url || media?.browser_native_sd_url 
+    ? [
+        { progressive_url: media.browser_native_hd_url, metadata: { quality: 'HD' } },
+        { progressive_url: media.browser_native_sd_url, metadata: { quality: 'SD' } }
+      ]
+    : (media?.playable_url_quality_hd || media?.playable_url)
+      ? [{ progressive_url: media.playable_url_quality_hd || media.playable_url, metadata: { quality: 'HD' } }]
+      : [];
 
-  if (hasHighDash) {
-    const videoTemp = path.join(folderPath, `${baseName}.video.mp4`);
-    const audioTemp = dashAudioUrl ? path.join(folderPath, `${baseName}.audio.m4a`) : null;
+  // Ưu tiên DASH
+  if (dash) {
+    const parsed = parseDashManifest(dash);
+    if (parsed.video) {
+      const videoTemp = path.join(folderPath, `${baseName}.video.mp4`);
+      const audioTemp = path.join(folderPath, `${baseName}.audio.mp4`);
+      const finalPath = path.join(folderPath, `${baseName}.DASH_${parsed.video.quality || 'HQ'}.mp4`);
 
-    const vOk = await downloadFile(dashVideoUrl, videoTemp);
-    if (!vOk) return null;
+      const vOk = await downloadFile(parsed.video.uri, videoTemp);
+      if (!vOk) return null;
 
-    if (audioTemp) {
-      const aOk = await downloadFile(dashAudioUrl, audioTemp);
-      if (aOk) {
-        try {
-          await execPromise(
-            `ffmpeg -i "${videoTemp}" -i "${audioTemp}" -c copy -map 0:v:0 -map 1:a:0 "${finalPath}" -y`
-          );
-          await fs.unlink(videoTemp).catch(() => {});
-          await fs.unlink(audioTemp).catch(() => {});
-        } catch (mergeErr) {
-          console.error(`Merge failed for ${id}, keeping video only`, mergeErr);
+      if (parsed.audio) {
+        const aOk = await downloadFile(parsed.audio.uri, audioTemp);
+        if (aOk) {
+          try {
+            await execPromise(`ffmpeg -i "${videoTemp}" -i "${audioTemp}" -c copy "${finalPath}"`);
+            await fs.unlink(videoTemp).catch(() => {});
+            await fs.unlink(audioTemp).catch(() => {});
+          } catch {
+            await fs.rename(videoTemp, finalPath).catch(() => {});
+          }
+        } else {
           await fs.rename(videoTemp, finalPath).catch(() => {});
         }
       } else {
         await fs.rename(videoTemp, finalPath).catch(() => {});
       }
-    } else {
-      await fs.rename(videoTemp, finalPath).catch(() => {});
+      console.log(`DASH high quality → ${finalPath}`);
+      return finalPath;
     }
-    console.log(`DASH high quality → ${finalPath}`);
-    return finalPath;
   }
 
   // Fallback progressive
@@ -363,10 +391,20 @@ async function processProfile(profileUrl) {
   let username = 'Unknown';
 
   try {
-    const html = await fetchProfileHtml(profileUrl);
+    // ✅ Chuẩn hóa URL trước khi fetch
+    const normalizedUrl = normalizeProfileUrl(profileUrl);
+    console.log(`📍 Đang xử lý: ${normalizedUrl}`);
+    
+    const html = await fetchProfileHtml(normalizedUrl);
     const storyUrl = await extractStoryUrlFromProfile(html);
-    if (!storyUrl) return;
+    
+    if (!storyUrl) {
+      console.log(`   ℹ️  Không có story mới`);
+      return;
+    }
 
+    console.log(`   📖 Story URL: ${storyUrl}`);
+    
     const bucketIdMatch = storyUrl.match(/stories\/(\d+)/);
     if (!bucketIdMatch) return;
     const bucketId = bucketIdMatch[1];
@@ -419,37 +457,47 @@ async function processProfile(profileUrl) {
 
     if (downloadedFiles.length > 0) {
       await zipAndSend(folderPath, folderName);
-      console.log(`Gửi zip cho ${username} - ${downloadedFiles.length} file`);
+      console.log(`   ✅ Gửi zip cho ${username} - ${downloadedFiles.length} file`);
     } else {
       await fs.rm(folderPath, { recursive: true, force: true }).catch(() => {});
+      console.log(`   ℹ️  Không có file mới để download`);
     }
   } catch (err) {
-    console.error(`Lỗi profile ${profileUrl} (${username}):`, err.message);
+    console.error(`   ❌ Lỗi: ${err.message}`);
   }
 }
 
 async function processAllProfiles() {
   await cleanOldDownloaded();
+  db.read(); // Đảm bảo load data mới nhất
   const profiles = db.data.profiles || [];
+  console.log(`\n🚀 Bắt đầu xử lý ${profiles.length} profiles...`);
+  
   for (const url of profiles) {
     await processProfile(url);
   }
+  
+  console.log(`\n✅ Hoàn tất xử lý tất cả profiles\n`);
 }
 
-async function processSingleStory(storyUrl) {
+async function processSingleStory(storyUrl, ctx) {
   const today = await getTodayKey();
   let username = 'Unknown_Single';
 
   try {
+    console.log(`📖 Đang xử lý story: ${storyUrl}`);
+    
     const storyData = await fetchStoryJson(storyUrl);
     if (!storyData) throw new Error('Không lấy được dữ liệu story');
 
     username = getUsernameFromStoryData(storyData);
+    console.log(`   👤 Username: ${username}`);
 
     const bucketIdMatch = storyUrl.match(/stories\/(\d+)/);
     if (!bucketIdMatch) throw new Error('Không tìm thấy bucket ID');
 
     const bucketId = bucketIdMatch[1];
+    console.log(`   🆔 Bucket ID: ${bucketId}`);
 
     let bucketData = null;
     storyData.require?.forEach(req => {
@@ -461,8 +509,10 @@ async function processSingleStory(storyUrl) {
     if (!bucketData) throw new Error('Không tìm thấy bucket data');
 
     const nodes = bucketData.unified_stories_with_notes?.edges || [];
+    console.log(`   📊 Tìm thấy ${nodes.length} story items`);
+    
     if (!nodes.length) {
-      await bot.telegram.sendMessage(ADMIN_CHAT_ID, `Story ${storyUrl} không có media mới.`);
+      await bot.telegram.sendMessage(ADMIN_CHAT_ID, `ℹ️ Story ${storyUrl} không có media mới.`);
       return;
     }
 
@@ -480,32 +530,41 @@ async function processSingleStory(storyUrl) {
       if (!media?.id) continue;
 
       const id = media.id;
-      if (await isDownloaded(id, today)) continue;
+      if (await isDownloaded(id, today)) {
+        console.log(`   ⏭️  Đã download: ${id}`);
+        continue;
+      }
 
       let filePath = null;
 
       if (media.__typename === 'Photo') {
+        console.log(`   📷 Downloading photo: ${id}`);
         filePath = await downloadPhoto(media, username, folderPath, id);
       } else if (media.__typename === 'Video') {
+        console.log(`   🎥 Downloading video: ${id}`);
         filePath = await downloadFacebookStoryVideo(media, username, folderPath, id);
       }
 
       if (filePath) {
         downloadedFiles.push(filePath);
         await markDownloaded(id, today);
+        console.log(`   ✅ Downloaded: ${path.basename(filePath)}`);
       }
     }
 
     if (downloadedFiles.length > 0) {
       await zipAndSend(folderPath, folderName);
-      await bot.telegram.sendMessage(ADMIN_CHAT_ID, `Đã tải và gửi ${downloadedFiles.length} file từ story riêng lẻ.`);
+      await bot.telegram.sendMessage(ADMIN_CHAT_ID, `✅ Đã tải và gửi ${downloadedFiles.length} file từ story riêng lẻ của ${username}`);
+      console.log(`   📦 Đã gửi zip với ${downloadedFiles.length} files`);
     } else {
       await fs.rm(folderPath, { recursive: true, force: true }).catch(() => {});
-      await bot.telegram.sendMessage(ADMIN_CHAT_ID, `Không có media mới từ story: ${storyUrl}`);
+      await bot.telegram.sendMessage(ADMIN_CHAT_ID, `ℹ️ Không có media mới từ story: ${storyUrl}`);
+      console.log(`   ℹ️  Không có file mới để download`);
     }
   } catch (err) {
-    console.error(`Lỗi xử lý story riêng: ${storyUrl}`, err);
-    await bot.telegram.sendMessage(ADMIN_CHAT_ID, `Lỗi khi xử lý story:\n${err.message}`);
+    console.error(`❌ Lỗi xử lý story:`, err);
+    await bot.telegram.sendMessage(ADMIN_CHAT_ID, `❌ Lỗi khi xử lý story:\n${err.message}\n\nStack: ${err.stack?.slice(0, 500)}`);
+    throw err;
   }
 }
 
