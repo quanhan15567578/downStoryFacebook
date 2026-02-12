@@ -12,7 +12,8 @@ const { JSONFileSync } = require('lowdb/node');
 const express = require('express');
 
 const adapter = new JSONFileSync('database.json');
-const db = new LowSync(adapter);
+const defaultData = { profiles: [], downloaded: {} };
+const db = new LowSync(adapter, defaultData);
 
 // Đảm bảo default
 if (!db.data) {
