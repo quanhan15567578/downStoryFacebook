@@ -7,8 +7,9 @@ const { exec } = require('child_process');
 const util = require('util');
 const archiver = require('archiver');
 const { DOMParser } = require('@xmldom/xmldom');
-import { LowSync } from 'lowdb';
-import { JSONFileSync } from 'lowdb/node';
+const { LowSync } = require('lowdb');
+const { JSONFileSync } = require('lowdb/node');
+const express = require('express');
 
 const adapter = new JSONFileSync('database.json');
 const db = new LowSync(adapter);
@@ -18,13 +19,14 @@ if (!db.data) {
   db.data = { profiles: [], downloaded: {} };
   db.write();
 }
-const TELEGRAM_TOKEN = '8578868890:AAFs1-9_CDQYF81GRVeAJcZI5p_lFuViInc';           // ← thay bằng token thật
-const ADMIN_CHAT_ID = 452130340;                
-
-const db = low(new FileSync('database.json'));
-db.defaults({ profiles: [], downloaded: {} }).write();
 
 const execPromise = util.promisify(exec);
+
+// Token từ env (bắt buộc!)
+const TELEGRAM_TOKEN = '8578868890:AAFs1-9_CDQYF81GRVeAJcZI5p_lFuViInc';
+
+const ADMIN_CHAT_ID = 452130340;  // Nếu muốn, chuyển sang process.env.ADMIN_CHAT_ID
+
 const bot = new Telegraf(TELEGRAM_TOKEN);
 
 // ──────────────────────────────────────── Middleware: Chỉ admin dùng lệnh ────────────────────────────────────────
@@ -49,27 +51,28 @@ bot.command('startdl', async (ctx) => {
   ctx.reply('Hoàn tất kiểm tra hôm nay.');
 });
 
-bot.hears(/^DOWN\s+(https?:\/\/.+)$/i, async (ctx) => {
+bot.hears(/^X\s+(https?:\/\/.+)$/i, async (ctx) => {
   const url = ctx.match[1].trim();
   ctx.reply(`Đang xử lý story: ${url}`);
   await processSingleStory(url);
   ctx.reply('Xong lệnh X.');
 });
 
-bot.hears(/^ADD\s+(https?:\/\/facebook\.com\/[^\/\s]+)$/i, async (ctx) => {
+bot.hears(/^Y\s+(https?:\/\/facebook\.com\/[^\/\s]+)$/i, async (ctx) => {
   let url = ctx.match[1].trim();
   if (!url.startsWith('https://')) url = 'https://' + url;
 
-  const profiles = db.get('profiles').value() || [];
+  const profiles = db.data.profiles || [];
   if (profiles.includes(url) || profiles.includes(url.replace('www.', ''))) {
     return ctx.reply('Profile này đã có trong danh sách.');
   }
 
-  db.get('profiles').push(url).write();
+  db.data.profiles.push(url);
+  db.write();
   ctx.reply(`Đã thêm profile: ${url}`);
 });
 
-bot.hears(/^REMOVE\s+(.+)$/i, async (ctx) => {
+bot.hears(/^DEL\s+(.+)$/i, async (ctx) => {
   let input = ctx.match[1].trim();
   let url;
 
@@ -79,7 +82,7 @@ bot.hears(/^REMOVE\s+(.+)$/i, async (ctx) => {
     url = `https://www.facebook.com/${input.trim()}`;
   }
 
-  const profiles = db.get('profiles').value() || [];
+  const profiles = db.data.profiles || [];
   const normalized = [url, url.replace('www.', ''), url.replace('https://facebook.com/', 'https://www.facebook.com/')];
 
   const newProfiles = profiles.filter(p => !normalized.includes(p));
@@ -88,12 +91,13 @@ bot.hears(/^REMOVE\s+(.+)$/i, async (ctx) => {
     return ctx.reply('Không tìm thấy profile để xoá.');
   }
 
-  db.set('profiles', newProfiles).write();
+  db.data.profiles = newProfiles;
+  db.write();
   ctx.reply(`Đã xoá: ${url}`);
 });
 
-bot.command('LIST', (ctx) => {
-  const profiles = db.get('profiles').value() || [];
+bot.command('list', (ctx) => {
+  const profiles = db.data.profiles || [];
   if (!profiles.length) return ctx.reply('Danh sách trống.');
   ctx.reply(`Danh sách profiles (${profiles.length}):\n${profiles.join('\n')}`);
 });
@@ -106,23 +110,25 @@ async function getTodayKey() {
 async function cleanOldDownloaded() {
   const today = await getTodayKey();
   const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
-  const state = db.get('downloaded').value() || {};
+  const state = db.data.downloaded || {};
   Object.keys(state).forEach(key => {
     if (key !== today && key !== yesterday) {
-      db.get('downloaded').unset(key).write();
+      delete db.data.downloaded[key];
     }
   });
+  db.write();
 }
 
 async function isDownloaded(id, dateKey) {
-  return (db.get(`downloaded.${dateKey}`).value() || []).includes(id);
+  return (db.data.downloaded?.[dateKey] || []).includes(id);
 }
 
 async function markDownloaded(id, dateKey) {
-  let arr = db.get(`downloaded.${dateKey}`).value() || [];
-  if (!arr.includes(id)) {
-    arr.push(id);
-    db.set(`downloaded.${dateKey}`, arr).write();
+  if (!db.data.downloaded) db.data.downloaded = {};
+  if (!db.data.downloaded[dateKey]) db.data.downloaded[dateKey] = [];
+  if (!db.data.downloaded[dateKey].includes(id)) {
+    db.data.downloaded[dateKey].push(id);
+    db.write();
   }
 }
 
@@ -225,7 +231,7 @@ function parseDashManifest(xml) {
 async function downloadFile(url, outputPath) {
   try {
     const res = await axios.get(url, { responseType: 'stream', timeout: 60000 });
-    const writer = fs.createWriteStream(outputPath);
+    const writer = (await fs.open(outputPath, 'w')).createWriteStream();
     res.data.pipe(writer);
     await new Promise((resolve, reject) => {
       writer.on('finish', resolve);
@@ -330,7 +336,7 @@ async function downloadPhoto(media, username, folderPath, id) {
 // ──────────────────────────────────────── Zip & Send ────────────────────────────────────────
 async function zipAndSend(folderPath, folderName) {
   const zipPath = `${folderPath}.zip`;
-  const output = fs.createWriteStream(zipPath);
+  const output = (await fs.open(zipPath, 'w')).createWriteStream();
   const archive = archiver('zip', { zlib: { level: 9 } });
 
   await new Promise((resolve, reject) => {
@@ -423,7 +429,7 @@ async function processProfile(profileUrl) {
 
 async function processAllProfiles() {
   await cleanOldDownloaded();
-  const profiles = db.get('profiles').value() || [];
+  const profiles = db.data.profiles || [];
   for (const url of profiles) {
     await processProfile(url);
   }
@@ -502,10 +508,32 @@ async function processSingleStory(storyUrl) {
   }
 }
 
-// ──────────────────────────────────────── Khởi động Bot ────────────────────────────────────────
-bot.launch()
-  .then(() => console.log('Bot đã chạy...'))
-  .catch(err => console.error('Lỗi khởi động bot:', err));
+// ──────────────────────────────────────── Khởi động Bot với Webhook ────────────────────────────────────────
+const app = express();
+
+// Để Render check healthy
+app.get('/', (req, res) => {
+  res.send('Facebook Story Downloader Bot is running!');
+});
+
+// Webhook path (nên secret để tránh abuse)
+const SECRET_PATH = '/telegraf/' + TELEGRAM_TOKEN.replace(/:/g, '');  // Làm secret dựa trên token
+
+app.use(bot.webhookCallback(SECRET_PATH));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, async () => {
+  console.log(`Server chạy trên port ${PORT}`);
+
+  // Set webhook
+  const webhookUrl = `https://${process.env.RENDER_EXTERNAL_HOSTNAME || 'your-render-app-name.onrender.com'}${SECRET_PATH}`;
+  try {
+    await bot.telegram.setWebhook(webhookUrl);
+    console.log(`Webhook đã set thành công: ${webhookUrl}`);
+  } catch (err) {
+    console.error('Lỗi set webhook:', err);
+  }
+});
 
 // Graceful shutdown
 process.once('SIGINT', () => bot.stop('SIGINT'));
