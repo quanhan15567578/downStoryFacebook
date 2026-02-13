@@ -1,46 +1,50 @@
 const { Telegraf } = require('telegraf');
 const axios = require('axios');
+const cheerio = require('cheerio');
 const fs = require('fs/promises');
 const path = require('path');
 const { exec } = require('child_process');
 const util = require('util');
 const archiver = require('archiver');
+const { DOMParser } = require('@xmldom/xmldom');
 const { LowSync } = require('lowdb');
 const { JSONFileSync } = require('lowdb/node');
 const express = require('express');
 
 const adapter = new JSONFileSync('database.json');
-const defaultData = { profiles: [], downloaded: {}, access_token: null };
+const defaultData = { profiles: [], downloaded: {}, cookies: null };
 const db = new LowSync(adapter, defaultData);
 
 db.read();
 
 if (!db.data) {
-  db.data = { profiles: [], downloaded: {}, access_token: null };
+  db.data = { profiles: [], downloaded: {}, cookies: null };
   db.write();
 }
 
 const execPromise = util.promisify(exec);
 
+// Token từ env (bắt buộc!)
 const TELEGRAM_TOKEN = '8578868890:AAFs1-9_CDQYF81GRVeAJcZI5p_lFuViInc';
+
 const ADMIN_CHAT_ID = 452130340;
 
 const bot = new Telegraf(TELEGRAM_TOKEN);
 
-// ──────────────────────────────────────── Access Token Management ────────────────────────────────────────
-function getAccessToken() {
+// ──────────────────────────────────────── Cookie Management ────────────────────────────────────────
+function getCookieString() {
   db.read();
-  return db.data.access_token || null;
+  return db.data.cookies || null;
 }
 
-function saveAccessToken(token) {
+function saveCookies(cookieString) {
   db.read();
-  db.data.access_token = token;
+  db.data.cookies = cookieString;
   db.write();
-  console.log('✅ Đã lưu access token vào database');
+  console.log('✅ Đã lưu cookies vào database');
 }
 
-// ──────────────────────────────────────── Helper ────────────────────────────────────────
+// ──────────────────────────────────────── Helper: Normalize URL ────────────────────────────────────────
 function normalizeProfileUrl(url) {
   let normalized = url.trim();
   
@@ -54,19 +58,153 @@ function normalizeProfileUrl(url) {
   return normalized;
 }
 
-function extractUsernameFromUrl(url) {
-  // Extract username/id from Facebook URL
-  const match = url.match(/facebook\.com\/([^\/\?]+)/);
-  return match ? match[1] : null;
+// ──────────────────────────────────────── CRITICAL: Browser-like Headers ────────────────────────────────────────
+function getBrowserHeaders(cookie, referer = null) {
+  // Dựa trên extension headers - giả lập Chrome browser
+  const headers = {
+    'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+    'accept-encoding': 'gzip, deflate, br, zstd',
+    'accept-language': 'vi,en-US;q=0.9,en;q=0.8,fr-FR;q=0.7,fr;q=0.6',
+    'cache-control': 'max-age=0',
+    'sec-ch-ua': '"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+    'sec-fetch-dest': 'document',
+    'sec-fetch-mode': 'navigate',
+    'sec-fetch-site': 'none',
+    'sec-fetch-user': '?1',
+    'upgrade-insecure-requests': '1',
+    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+    'viewport-width': '1920'
+  };
+
+  if (cookie) {
+    headers['cookie'] = cookie;
+  }
+
+  if (referer) {
+    headers['referer'] = referer;
+    headers['sec-fetch-site'] = 'same-origin';
+  }
+
+  return headers;
 }
 
-function extractStoryId(url) {
-  // Extract story ID from story URL
-  const match = url.match(/stories\/(\d+)/);
-  return match ? match[1] : null;
+// ──────────────────────────────────────── Enhanced Fetch với Browser Simulation ────────────────────────────────────────
+async function fetchWithHeaders(url, options = {}) {
+  const cookie = getCookieString();
+  
+  const config = {
+    method: options.method || 'GET',
+    url: url,
+    headers: getBrowserHeaders(cookie, options.referer),
+    timeout: 30000,
+    maxRedirects: 5,
+    validateStatus: (status) => status < 500, // Accept redirects
+    ...options
+  };
+
+  // CRITICAL: Support zstd compression như browser thật
+  // Node.js axios mặc định chỉ support gzip, deflate, br
+  // Nếu server trả về zstd, cần decompress manually
+  // Tuy nhiên axios sẽ tự động handle gzip, deflate, br
+  
+  try {
+    const response = await axios(config);
+    
+    // Log để debug
+    console.log(`📡 Fetch ${url.substring(0, 80)}... → Status: ${response.status}`);
+    
+    return response;
+  } catch (error) {
+    console.error(`❌ Fetch error for ${url}:`, error.message);
+    throw error;
+  }
 }
 
-// ──────────────────────────────────────── Middleware ────────────────────────────────────────
+async function fetchProfileHtml(profileUrl) {
+  const response = await fetchWithHeaders(profileUrl);
+  
+  if (response.status === 302 || response.status === 301) {
+    console.log('⚠️ Redirect detected - cookie có thể cần refresh');
+  }
+  
+  return response.data;
+}
+
+async function fetchStoryJson(storyUrl) {
+  // Khi fetch story JSON, cần set referer là profile page
+  const profileUrl = storyUrl.split('/stories/')[0];
+  
+  const response = await fetchWithHeaders(storyUrl, {
+    referer: profileUrl
+  });
+  
+  if (response.status !== 200) {
+    throw new Error(`HTTP ${response.status} khi fetch story`);
+  }
+
+  const html = response.data;
+  
+  // Extract JSON từ HTML
+  const scriptMatch = html.match(/<script[^>]*>requireLazy\(\["CometSuspenseFalcoEvent"\][^<]*<\/script>/);
+  if (!scriptMatch) {
+    throw new Error('Không tìm thấy script data trong story page');
+  }
+
+  const scriptContent = scriptMatch[0];
+  const jsonMatch = scriptContent.match(/\{.*"require":\[\[.*?\]\].*\}/s);
+  
+  if (!jsonMatch) {
+    throw new Error('Không parse được JSON từ script');
+  }
+
+  try {
+    return JSON.parse(jsonMatch[0]);
+  } catch (err) {
+    throw new Error('JSON parse failed: ' + err.message);
+  }
+}
+
+async function downloadFile(url, targetPath) {
+  try {
+    const cookie = getCookieString();
+    
+    const response = await axios({
+      method: 'GET',
+      url: url,
+      responseType: 'stream',
+      headers: {
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+        'accept': '*/*',
+        'accept-encoding': 'gzip, deflate, br',
+        'referer': 'https://www.facebook.com/',
+        'cookie': cookie || '',
+        'sec-ch-ua': '"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Windows"',
+        'sec-fetch-dest': 'video',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'same-origin'
+      },
+      timeout: 120000, // 2 minutes cho video lớn
+      maxRedirects: 5
+    });
+
+    const writer = (await fs.open(targetPath, 'w')).createWriteStream();
+    response.data.pipe(writer);
+
+    return new Promise((resolve, reject) => {
+      writer.on('finish', () => resolve(true));
+      writer.on('error', reject);
+    });
+  } catch (err) {
+    console.error(`Download failed for ${url}:`, err.message);
+    return false;
+  }
+}
+
+// ──────────────────────────────────────── Middleware: Chỉ admin dùng lệnh ────────────────────────────────────────
 bot.use(async (ctx, next) => {
   if (ctx.from.id !== ADMIN_CHAT_ID) {
     if (['/start', '/help'].includes(ctx.message?.text)) {
@@ -77,121 +215,114 @@ bot.use(async (ctx, next) => {
   await next();
 });
 
-// ──────────────────────────────────────── Commands ────────────────────────────────────────
-bot.command('start', (ctx) => ctx.reply(`🤖 Facebook Story Downloader Bot (Graph API)
+// ──────────────────────────────────────── Lệnh điều khiển ────────────────────────────────────────
+bot.command('start', (ctx) => ctx.reply(`Facebook Story Downloader Bot
 
-📖 HƯỚNG DẪN:
+Các lệnh:
+/startdl → chạy tất cả profiles
+/list → xem danh sách profiles
+/cookie → hướng dẫn lấy cookie
+/showcookie → hiển thị cookie đang dùng
+/test → test cookie hiện tại
 
-1. Lấy Access Token:
-   /token → Xem hướng dẫn lấy token
-   SETTOKEN <token> → Set token mới
+DOWN <url> → tải 1 story
+ADD <url> → thêm profile
+REMOVE <url> → xóa profile
+SETCOOKIE <cookie> → set cookie mới
 
-2. Quản lý profiles:
-   ADD <url> → Thêm profile
-   REMOVE <url> → Xóa profile
-   /list → Xem danh sách
-
-3. Download:
-   DOWN <story_url> → Tải 1 story
-   /startdl → Tải tất cả profiles
-
-4. Tiện ích:
-   /test → Test token
-   /showtoken → Xem token hiện tại`));
+Ví dụ:
+DOWN https://facebook.com/stories/123
+ADD facebook.com/username
+SETCOOKIE datr=xxx;sb=yyy;c_user=zzz;xs=aaa...`));
 
 bot.command('help', (ctx) => ctx.reply('Gửi /start để xem hướng dẫn đầy đủ'));
 
-bot.command('token', (ctx) => {
-  ctx.reply(`📖 HƯỚNG DẪN LẤY ACCESS TOKEN:
-
-**CÁCH 1: Dùng Graph API Explorer (Khuyên dùng)**
-1. Mở: https://developers.facebook.com/tools/explorer
-2. Click "Get User Access Token"
-3. Chọn quyền:
-   ✅ user_photos
-   ✅ user_videos
-   ✅ user_posts
-4. Click "Generate Access Token"
-5. Copy token và gửi:
-   SETTOKEN <token_bạn_vừa_copy>
-
-**CÁCH 2: Dùng Bookmark Script**
-1. Tạo bookmark với code:
-javascript:(function(){prompt('Access Token',require('AccessToken').getToken())})();
-
-2. Mở Facebook, click bookmark
-3. Copy token và gửi:
-   SETTOKEN <token>
-
-**LƯU Ý:**
-• Token hết hạn sau 2 tháng
-• Cần token có quyền user_photos, user_videos
-• KHÔNG chia sẻ token với người khác`);
-});
-
-bot.command('showtoken', (ctx) => {
-  const token = getAccessToken();
-  if (!token) {
-    return ctx.reply('⚠️ Chưa có token!\n\nDùng lệnh /token để xem hướng dẫn.');
-  }
-  
-  const preview = token.length > 50 ? token.substring(0, 50) + '...' : token;
-  ctx.reply(`🔑 Access Token:\n${preview}\n\n📊 Độ dài: ${token.length} ký tự`);
-});
-
 bot.command('test', async (ctx) => {
-  const token = getAccessToken();
-  if (!token) {
-    return ctx.reply('⚠️ Chưa có token! Dùng /token để xem hướng dẫn.');
+  const cookie = getCookieString();
+  if (!cookie) {
+    return ctx.reply('⚠️ Chưa có cookie! Dùng lệnh /cookie để xem hướng dẫn.');
   }
   
-  ctx.reply('🔍 Đang test token...');
+  ctx.reply('🔍 Đang test cookie...');
   
   try {
-    // Test token bằng cách lấy thông tin user
-    const response = await axios.get(`https://graph.facebook.com/v18.0/me`, {
-      params: {
-        access_token: token,
-        fields: 'id,name'
-      }
-    });
+    const testUrl = 'https://www.facebook.com/';
+    const response = await fetchWithHeaders(testUrl);
     
-    ctx.reply(`✅ Token hoạt động tốt!\n\n👤 Logged in as: ${response.data.name}\n🆔 User ID: ${response.data.id}`);
+    if (response.status === 200 && response.data.includes('Facebook')) {
+      ctx.reply('✅ Cookie hoạt động tốt!\n\nBạn có thể dùng bot bình thường.');
+    } else {
+      ctx.reply('⚠️ Cookie có vẻ không ổn. Hãy thử lấy cookie mới.');
+    }
   } catch (err) {
-    ctx.reply(`❌ Token không hợp lệ hoặc đã hết hạn!\n\nLỗi: ${err.response?.data?.error?.message || err.message}\n\nHãy lấy token mới: /token`);
+    ctx.reply(`❌ Lỗi khi test cookie:\n${err.message}\n\nHãy lấy cookie mới và thử lại.`);
   }
 });
 
-bot.hears(/^SETTOKEN\s+(.+)$/is, async (ctx) => {
-  const token = ctx.match[1].trim();
-  
-  // Validate token format (Facebook tokens thường dài 100-300 ký tự)
-  if (token.length < 50) {
-    return ctx.reply('❌ Token không hợp lệ! Token phải dài ít nhất 50 ký tự.\n\nDùng /token để xem hướng dẫn lấy token.');
+bot.command('showcookie', (ctx) => {
+  const cookie = getCookieString();
+  if (!cookie) {
+    return ctx.reply('⚠️ Chưa có cookie nào được set.\n\nDùng lệnh:\nSETCOOKIE <cookie_string>');
   }
   
-  // Test token trước khi lưu
+  const preview = cookie.length > 100 ? cookie.substring(0, 100) + '...' : cookie;
+  ctx.reply(`🍪 Cookie hiện tại:\n${preview}\n\n📊 Độ dài: ${cookie.length} ký tự`);
+});
+
+bot.command('cookie', (ctx) => {
+  ctx.reply(`📖 HƯỚNG DẪN LẤY COOKIE FACEBOOK:
+
+1. Mở Facebook trong Chrome/Edge
+2. Nhấn F12 để mở DevTools
+3. Vào tab "Application" → "Cookies" → "https://www.facebook.com"
+4. Copy các giá trị sau (QUAN TRỌNG):
+   • datr (bắt buộc)
+   • sb (bắt buộc)
+   • c_user (bắt buộc)
+   • xs (bắt buộc)
+   • fr (tùy chọn)
+   • presence (tùy chọn)
+   • wd (tùy chọn)
+
+5. Ghép thành string:
+datr=VALUE1; sb=VALUE2; c_user=VALUE3; xs=VALUE4; fr=VALUE5
+
+6. Gửi cho bot:
+SETCOOKIE datr=xxx; sb=yyy; c_user=zzz; xs=aaa...
+
+⚠️ QUAN TRỌNG:
+• Phải có đủ 4 cookie: datr, sb, c_user, xs
+• Cookie có thể hết hạn sau vài tuần
+• KHÔNG chia sẻ cookie với người khác
+• Copy CHÍNH XÁC từ DevTools (bao gồm cả dấu chấm phẩy)`);
+});
+
+bot.hears(/^SETCOOKIE\s+(.+)$/is, async (ctx) => {
+  const cookieString = ctx.match[1].trim();
+  
+  // Validate cookie
+  const required = ['datr', 'sb', 'c_user', 'xs'];
+  const missing = required.filter(key => !cookieString.includes(key));
+  
+  if (missing.length > 0) {
+    return ctx.reply(`❌ Cookie thiếu: ${missing.join(', ')}\n\nCần đủ 4 cookie:\ndatr, sb, c_user, xs\n\nVí dụ:\nSETCOOKIE datr=xxx; sb=yyy; c_user=zzz; xs=aaa...`);
+  }
+  
+  saveCookies(cookieString);
+  ctx.reply('✅ Đã lưu cookie thành công!\n\nDùng /test để kiểm tra cookie\nHoặc thử download:\nDOWN <story_url>');
+  
+  // Xóa message chứa cookie để bảo mật
   try {
-    await axios.get(`https://graph.facebook.com/v18.0/me`, {
-      params: { access_token: token, fields: 'id' }
-    });
-    
-    saveAccessToken(token);
-    ctx.reply('✅ Đã lưu token thành công!\n\nDùng /test để kiểm tra chi tiết\nHoặc DOWN <story_url> để tải story');
-    
-    // Xóa message chứa token
-    try {
-      await ctx.deleteMessage();
-    } catch (err) {}
+    await ctx.deleteMessage();
   } catch (err) {
-    ctx.reply(`❌ Token không hợp lệ!\n\nLỗi: ${err.response?.data?.error?.message || err.message}\n\nHãy kiểm tra lại token: /token`);
+    console.log('Cannot delete message');
   }
 });
 
 bot.command('startdl', async (ctx) => {
-  const token = getAccessToken();
-  if (!token) {
-    return ctx.reply('⚠️ Chưa có token! Dùng /token để xem hướng dẫn.');
+  const cookie = getCookieString();
+  if (!cookie) {
+    return ctx.reply('⚠️ Chưa có cookie! Dùng lệnh /cookie để xem hướng dẫn.');
   }
   
   ctx.reply('🚀 Bắt đầu kiểm tra và download stories...');
@@ -201,17 +332,17 @@ bot.command('startdl', async (ctx) => {
 
 bot.hears(/^DOWN\s+(https?:\/\/.+)$/i, async (ctx) => {
   const url = ctx.match[1].trim();
-  const token = getAccessToken();
+  const cookie = getCookieString();
   
-  if (!token) {
-    return ctx.reply('⚠️ Chưa có token! Dùng /token để xem hướng dẫn.');
+  if (!cookie) {
+    return ctx.reply('⚠️ Chưa có cookie! Dùng lệnh /cookie để xem hướng dẫn.');
   }
   
   ctx.reply(`📥 Đang xử lý story: ${url}`);
   try {
     await processSingleStory(url, ctx);
   } catch (err) {
-    ctx.reply(`❌ LỖI: ${err.message}\n\n💡 Thử:\n1. /test → Kiểm tra token\n2. /token → Lấy token mới`);
+    ctx.reply(`❌ LỖI: ${err.message}`);
   }
 });
 
@@ -228,7 +359,7 @@ bot.hears(/^ADD\s+(.+)$/i, async (ctx) => {
 
   db.data.profiles.push(url);
   db.write();
-  ctx.reply(`✅ Đã thêm: ${url}`);
+  ctx.reply(`✅ Đã thêm profile: ${url}`);
 });
 
 bot.hears(/^REMOVE\s+(.+)$/i, async (ctx) => {
@@ -238,7 +369,7 @@ bot.hears(/^REMOVE\s+(.+)$/i, async (ctx) => {
   if (input.startsWith('http')) {
     url = normalizeProfileUrl(input);
   } else {
-    url = `https://www.facebook.com/${input}`;
+    url = `https://www.facebook.com/${input.trim()}`;
   }
 
   db.read();
@@ -252,7 +383,7 @@ bot.hears(/^REMOVE\s+(.+)$/i, async (ctx) => {
   const newProfiles = profiles.filter(p => !normalized.includes(p));
 
   if (newProfiles.length === profiles.length) {
-    return ctx.reply('❌ Không tìm thấy profile.');
+    return ctx.reply('❌ Không tìm thấy profile để xoá.');
   }
 
   db.data.profiles = newProfiles;
@@ -267,94 +398,119 @@ bot.command('list', (ctx) => {
   
   const preview = profiles.slice(0, 20).join('\n');
   const more = profiles.length > 20 ? `\n\n... và ${profiles.length - 20} profile khác` : '';
-  ctx.reply(`📋 Danh sách (${profiles.length}):\n\n${preview}${more}`);
+  ctx.reply(`📋 Danh sách profiles (${profiles.length}):\n\n${preview}${more}`);
 });
 
 // ──────────────────────────────────────── Utils ────────────────────────────────────────
 async function getTodayKey() {
-  return new Date().toISOString().slice(0, 10);
+  const now = new Date();
+  const yyyy = now.getFullYear();
+  const mm = String(now.getMonth() + 1).padStart(2, '0');
+  const dd = String(now.getDate()).padStart(2, '0');
+  return `${yyyy}${mm}${dd}`;
+}
+
+async function isDownloaded(mediaId, dateKey) {
+  db.read();
+  const downloaded = db.data.downloaded || {};
+  return downloaded[dateKey]?.includes(mediaId) || false;
+}
+
+async function markDownloaded(mediaId, dateKey) {
+  db.read();
+  if (!db.data.downloaded) db.data.downloaded = {};
+  if (!db.data.downloaded[dateKey]) db.data.downloaded[dateKey] = [];
+  db.data.downloaded[dateKey].push(mediaId);
+  db.write();
 }
 
 async function cleanOldDownloaded() {
   const today = await getTodayKey();
-  const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
   db.read();
-  const state = db.data.downloaded || {};
-  Object.keys(state).forEach(key => {
-    if (key !== today && key !== yesterday) {
-      delete db.data.downloaded[key];
+  const downloaded = db.data.downloaded || {};
+  const keys = Object.keys(downloaded);
+  
+  const toDelete = keys.filter(k => k !== today);
+  toDelete.forEach(k => delete downloaded[k]);
+  
+  db.data.downloaded = downloaded;
+  db.write();
+  
+  if (toDelete.length > 0) {
+    console.log(`🧹 Cleaned ${toDelete.length} old download records`);
+  }
+}
+
+function extractStoryUrlFromProfile(html) {
+  const $ = cheerio.load(html);
+  
+  // Tìm link story trong HTML
+  let storyUrl = null;
+  
+  $('a[href*="/stories/"]').each((i, elem) => {
+    const href = $(elem).attr('href');
+    if (href && href.includes('/stories/') && !storyUrl) {
+      storyUrl = href.startsWith('http') ? href : `https://www.facebook.com${href}`;
     }
   });
-  db.write();
+  
+  return storyUrl;
 }
 
-async function isDownloaded(id, dateKey) {
-  db.read();
-  return (db.data.downloaded?.[dateKey] || []).includes(id);
-}
-
-async function markDownloaded(id, dateKey) {
-  db.read();
-  if (!db.data.downloaded) db.data.downloaded = {};
-  if (!db.data.downloaded[dateKey]) db.data.downloaded[dateKey] = [];
-  if (!db.data.downloaded[dateKey].includes(id)) {
-    db.data.downloaded[dateKey].push(id);
-    db.write();
-  }
-}
-
-// ──────────────────────────────────────── Graph API Functions ────────────────────────────────────────
-async function getUserStories(userId) {
-  const token = getAccessToken();
+function getUsernameFromStoryData(storyData) {
+  let username = 'Unknown';
   
   try {
-    // Lấy stories từ Graph API
-    const response = await axios.get(`https://graph.facebook.com/v18.0/${userId}/stories`, {
-      params: {
-        access_token: token,
-        fields: 'id,from,created_time,permalink_url,attachments{media,media_type,url,subattachments}'
+    storyData.require?.forEach(req => {
+      if (req?.[3]?.[0]?.__bbox?.result?.data?.bucket?.owner?.name) {
+        username = req[3][0].__bbox.result.data.bucket.owner.name;
       }
     });
-    
-    return response.data.data || [];
   } catch (err) {
-    console.error(`Lỗi lấy stories: ${err.response?.data?.error?.message || err.message}`);
-    return [];
+    console.log('Could not extract username from story data');
   }
-}
-
-async function getStoryById(storyId) {
-  const token = getAccessToken();
   
-  try {
-    const response = await axios.get(`https://graph.facebook.com/v18.0/${storyId}`, {
-      params: {
-        access_token: token,
-        fields: 'id,from,created_time,permalink_url,attachments{media,media_type,url,subattachments}'
-      }
-    });
-    
-    return response.data;
-  } catch (err) {
-    console.error(`Lỗi lấy story: ${err.response?.data?.error?.message || err.message}`);
-    return null;
-  }
+  return username;
 }
 
-async function downloadFile(url, outputPath) {
-  try {
-    const res = await axios.get(url, { responseType: 'stream', timeout: 60000 });
-    const writer = (await fs.open(outputPath, 'w')).createWriteStream();
-    res.data.pipe(writer);
-    await new Promise((resolve, reject) => {
-      writer.on('finish', resolve);
-      writer.on('error', reject);
-    });
-    return true;
-  } catch (err) {
-    console.error(`Download failed: ${url} → ${err.message}`);
-    return false;
+async function downloadFacebookStoryVideo(media, username, folderPath, id) {
+  const qualities = [
+    { key: 'hd_playback_url', quality: 'HD' },
+    { key: 'sd_playback_url', quality: 'SD' },
+    { key: 'playable_url', quality: 'Standard' }
+  ];
+
+  for (const { key, quality } of qualities) {
+    const url = media[key];
+    if (!url) continue;
+
+    const filename = `${id} - ${username.replace(/[^a-zA-Z0-9]/g, '_')}.mp4`;
+    const targetPath = path.join(folderPath, filename);
+
+    const ok = await downloadFile(url, targetPath);
+    if (ok) {
+      console.log(`   ✅ Downloaded ${quality} video → ${targetPath}`);
+      return targetPath;
+    }
   }
+  
+  return null;
+}
+
+async function downloadPhoto(media, username, folderPath, id) {
+  const url = media?.image?.uri;
+  if (!url) return null;
+
+  let ext = 'jpg';
+  try {
+    ext = new URL(url).pathname.split('.').pop().split('?')[0] || 'jpg';
+  } catch {}
+
+  const filename = `${id} - ${username.replace(/[^a-zA-Z0-9]/g, '_')}.${ext}`;
+  const filepath = path.join(folderPath, filename);
+
+  const ok = await downloadFile(url, filepath);
+  return ok ? filepath : null;
 }
 
 // ──────────────────────────────────────── Zip & Send ────────────────────────────────────────
@@ -383,80 +539,78 @@ async function zipAndSend(folderPath, folderName) {
 // ──────────────────────────────────────── Core Processing ────────────────────────────────────────
 async function processProfile(profileUrl) {
   const today = await getTodayKey();
-  
+  let username = 'Unknown';
+
   try {
-    const username = extractUsernameFromUrl(profileUrl);
-    if (!username) {
-      console.log(`❌ Không thể extract username từ: ${profileUrl}`);
-      return;
-    }
+    const normalizedUrl = normalizeProfileUrl(profileUrl);
+    console.log(`📍 Đang xử lý: ${normalizedUrl}`);
     
-    console.log(`📍 Đang xử lý: ${username}`);
+    const html = await fetchProfileHtml(normalizedUrl);
+    const storyUrl = await extractStoryUrlFromProfile(html);
     
-    const stories = await getUserStories(username);
-    
-    if (!stories.length) {
+    if (!storyUrl) {
       console.log(`   ℹ️  Không có story mới`);
       return;
     }
+
+    console.log(`   📖 Story URL: ${storyUrl}`);
     
-    console.log(`   📊 Tìm thấy ${stories.length} stories`);
-    
+    const bucketIdMatch = storyUrl.match(/stories\/(\d+)/);
+    if (!bucketIdMatch) return;
+    const bucketId = bucketIdMatch[1];
+
+    const storyData = await fetchStoryJson(storyUrl);
+    if (!storyData) return;
+
+    username = getUsernameFromStoryData(storyData);
+
+    let bucketData = null;
+    storyData.require?.forEach(req => {
+      if (req?.[3]?.[0]?.__bbox?.result?.data?.bucket?.id === bucketId) {
+        bucketData = req[3][0].__bbox.result.data.bucket;
+      }
+    });
+    if (!bucketData) return;
+
+    const nodes = bucketData.unified_stories_with_notes?.edges || [];
+    if (!nodes.length) return;
+
     const folderName = `${username} - ${today}`;
     const folderPath = path.join(__dirname, 'temp', folderName);
     await fs.mkdir(folderPath, { recursive: true });
-    
+
     let downloadedFiles = [];
-    
-    for (const story of stories) {
-      const storyId = story.id;
-      
-      if (await isDownloaded(storyId, today)) {
-        console.log(`   ⏭️  Đã download: ${storyId}`);
-        continue;
+
+    for (const edge of nodes) {
+      const node = edge.node;
+      if (node?.story_card_info?.bucket?.camera_post_type === 'ADMINED_ADDITIONAL_PROFILE_STORY') continue;
+
+      const media = node?.attachments?.[0]?.media;
+      if (!media?.id) continue;
+
+      const id = media.id;
+      if (await isDownloaded(id, today)) continue;
+
+      let filePath = null;
+
+      if (media.__typename === 'Photo') {
+        filePath = await downloadPhoto(media, username, folderPath, id);
+      } else if (media.__typename === 'Video') {
+        filePath = await downloadFacebookStoryVideo(media, username, folderPath, id);
       }
-      
-      // Lấy media URLs
-      const attachments = story.attachments?.data || [];
-      
-      for (const attachment of attachments) {
-        const mediaType = attachment.media_type;
-        const media = attachment.media;
-        
-        if (!media) continue;
-        
-        let fileUrl = null;
-        let ext = '';
-        
-        if (mediaType === 'photo') {
-          fileUrl = media.image?.src;
-          ext = 'jpg';
-        } else if (mediaType === 'video') {
-          fileUrl = media.source;
-          ext = 'mp4';
-        }
-        
-        if (!fileUrl) continue;
-        
-        const filename = `${storyId}.${ext}`;
-        const filepath = path.join(folderPath, filename);
-        
-        const ok = await downloadFile(fileUrl, filepath);
-        if (ok) {
-          downloadedFiles.push(filepath);
-          console.log(`   ✅ Downloaded: ${filename}`);
-        }
+
+      if (filePath) {
+        downloadedFiles.push(filePath);
+        await markDownloaded(id, today);
       }
-      
-      await markDownloaded(storyId, today);
     }
-    
+
     if (downloadedFiles.length > 0) {
       await zipAndSend(folderPath, folderName);
-      console.log(`   📦 Gửi zip: ${downloadedFiles.length} files`);
+      console.log(`   ✅ Gửi zip cho ${username} - ${downloadedFiles.length} file`);
     } else {
       await fs.rm(folderPath, { recursive: true, force: true }).catch(() => {});
-      console.log(`   ℹ️  Không có file mới`);
+      console.log(`   ℹ️  Không có file mới để download`);
     }
   } catch (err) {
     console.error(`   ❌ Lỗi: ${err.message}`);
@@ -471,92 +625,111 @@ async function processAllProfiles() {
   
   for (const url of profiles) {
     await processProfile(url);
-    await new Promise(resolve => setTimeout(resolve, 2000)); // 2s delay
+    // Delay 3-5s giữa các profile để tránh rate limit
+    const delay = 3000 + Math.random() * 2000;
+    await new Promise(resolve => setTimeout(resolve, delay));
   }
   
-  console.log(`\n✅ Hoàn tất\n`);
+  console.log(`\n✅ Hoàn tất xử lý tất cả profiles\n`);
 }
 
 async function processSingleStory(storyUrl, ctx) {
   const today = await getTodayKey();
-  
+  let username = 'Unknown_Single';
+
   try {
-    console.log(`📖 Đang xử lý: ${storyUrl}`);
+    console.log(`📖 Đang xử lý story: ${storyUrl}`);
     
-    const storyId = extractStoryId(storyUrl);
-    if (!storyId) {
-      throw new Error('Không thể extract story ID từ URL');
-    }
-    
-    const story = await getStoryById(storyId);
-    if (!story) {
-      throw new Error('Không lấy được dữ liệu story - có thể token hết hạn hoặc story không tồn tại');
-    }
-    
-    const username = story.from?.name || story.from?.id || 'Unknown';
+    const storyData = await fetchStoryJson(storyUrl);
+    if (!storyData) throw new Error('Không lấy được dữ liệu story - có thể cookie hết hạn hoặc story không tồn tại');
+
+    username = getUsernameFromStoryData(storyData);
     console.log(`   👤 Username: ${username}`);
+
+    const bucketIdMatch = storyUrl.match(/stories\/(\d+)/);
+    if (!bucketIdMatch) throw new Error('Không tìm thấy bucket ID trong URL');
+
+    const bucketId = bucketIdMatch[1];
+    console.log(`   🆔 Bucket ID: ${bucketId}`);
+
+    let bucketData = null;
+    storyData.require?.forEach(req => {
+      if (req?.[3]?.[0]?.__bbox?.result?.data?.bucket?.id === bucketId) {
+        bucketData = req[3][0].__bbox.result.data.bucket;
+      }
+    });
+
+    if (!bucketData) throw new Error('Không tìm thấy bucket data - story có thể đã hết hạn');
+
+    const nodes = bucketData.unified_stories_with_notes?.edges || [];
+    console.log(`   📊 Tìm thấy ${nodes.length} story items`);
     
+    if (!nodes.length) {
+      await bot.telegram.sendMessage(ADMIN_CHAT_ID, `ℹ️ Story ${storyUrl} không có media.`);
+      return;
+    }
+
     const folderName = `${username} - ${today} - SINGLE`;
     const folderPath = path.join(__dirname, 'temp', folderName);
     await fs.mkdir(folderPath, { recursive: true });
-    
+
     let downloadedFiles = [];
-    
-    const attachments = story.attachments?.data || [];
-    
-    for (const attachment of attachments) {
-      const mediaType = attachment.media_type;
-      const media = attachment.media;
-      
-      if (!media) continue;
-      
-      let fileUrl = null;
-      let ext = '';
-      
-      if (mediaType === 'photo') {
-        fileUrl = media.image?.src;
-        ext = 'jpg';
-        console.log(`   📷 Downloading photo...`);
-      } else if (mediaType === 'video') {
-        fileUrl = media.source;
-        ext = 'mp4';
-        console.log(`   🎥 Downloading video...`);
+
+    for (const edge of nodes) {
+      const node = edge.node;
+      if (node?.story_card_info?.bucket?.camera_post_type === 'ADMINED_ADDITIONAL_PROFILE_STORY') continue;
+
+      const media = node?.attachments?.[0]?.media;
+      if (!media?.id) continue;
+
+      const id = media.id;
+      if (await isDownloaded(id, today)) {
+        console.log(`   ⏭️  Đã download: ${id}`);
+        continue;
       }
-      
-      if (!fileUrl) continue;
-      
-      const filename = `${storyId}.${ext}`;
-      const filepath = path.join(folderPath, filename);
-      
-      const ok = await downloadFile(fileUrl, filepath);
-      if (ok) {
-        downloadedFiles.push(filepath);
-        console.log(`   ✅ Downloaded: ${filename}`);
+
+      let filePath = null;
+
+      if (media.__typename === 'Photo') {
+        console.log(`   📷 Downloading photo: ${id}`);
+        filePath = await downloadPhoto(media, username, folderPath, id);
+      } else if (media.__typename === 'Video') {
+        console.log(`   🎥 Downloading video: ${id}`);
+        filePath = await downloadFacebookStoryVideo(media, username, folderPath, id);
+      }
+
+      if (filePath) {
+        downloadedFiles.push(filePath);
+        await markDownloaded(id, today);
+        console.log(`   ✅ Downloaded: ${path.basename(filePath)}`);
       }
     }
-    
+
     if (downloadedFiles.length > 0) {
       await zipAndSend(folderPath, folderName);
-      await bot.telegram.sendMessage(ADMIN_CHAT_ID, `✅ Đã tải ${downloadedFiles.length} file từ story của ${username}`);
+      await bot.telegram.sendMessage(ADMIN_CHAT_ID, `✅ Đã tải và gửi ${downloadedFiles.length} file từ story của ${username}`);
+      console.log(`   📦 Đã gửi zip với ${downloadedFiles.length} files`);
     } else {
       await fs.rm(folderPath, { recursive: true, force: true }).catch(() => {});
-      await bot.telegram.sendMessage(ADMIN_CHAT_ID, `ℹ️ Không có media từ: ${storyUrl}`);
+      await bot.telegram.sendMessage(ADMIN_CHAT_ID, `ℹ️ Không có media mới từ story: ${storyUrl}`);
+      console.log(`   ℹ️  Không có file mới để download`);
     }
   } catch (err) {
-    console.error(`❌ Lỗi:`, err);
-    await bot.telegram.sendMessage(ADMIN_CHAT_ID, `❌ Lỗi:\n${err.message}\n\n💡 Kiểm tra:\n1. /test → Test token\n2. /token → Lấy token mới`);
+    console.error(`❌ Lỗi xử lý story:`, err);
+    await bot.telegram.sendMessage(ADMIN_CHAT_ID, `❌ Lỗi:\n${err.message}\n\n💡 Thử:\n1. Kiểm tra cookie: /test\n2. Lấy cookie mới: /cookie\n3. Set lại: SETCOOKIE ...`);
     throw err;
   }
 }
 
-// ──────────────────────────────────────── Server ────────────────────────────────────────
+// ──────────────────────────────────────── Khởi động Bot với Webhook ────────────────────────────────────────
 const app = express();
 
 app.get('/', (req, res) => {
-  res.send('Facebook Story Downloader Bot (Graph API) is running!');
+  res.send('Facebook Story Downloader Bot is running!');
 });
 
 const SECRET_PATH = '/telegraf/' + TELEGRAM_TOKEN.replace(/:/g, '');
+
 app.use(bot.webhookCallback(SECRET_PATH));
 
 const PORT = process.env.PORT || 3000;
@@ -566,7 +739,7 @@ app.listen(PORT, async () => {
   const webhookUrl = `https://${process.env.RENDER_EXTERNAL_HOSTNAME || 'your-render-app-name.onrender.com'}${SECRET_PATH}`;
   try {
     await bot.telegram.setWebhook(webhookUrl);
-    console.log(`Webhook đã set: ${webhookUrl}`);
+    console.log(`Webhook đã set thành công: ${webhookUrl}`);
   } catch (err) {
     console.error('Lỗi set webhook:', err);
   }
